@@ -81,6 +81,58 @@ def load_trajectory(trajectory_path):
     return traj["pose_cache_cameras"], traj["pose_cache_frames"], traj["pose_cache_values"]
 
 
+def select_frames_by_displacement(trajectory_path, frame_start, frame_end, min_step_m=0.15):
+    """
+    Select frames so that each consecutive pair is separated by at least
+    `min_step_m` of actual car travel (fused odometry).
+
+    This handles variable car speed, stops mid-scan, and acceleration naturally:
+    frames where the car barely moved are skipped; frames where it moved a lot
+    are included at the right density.
+
+    Uses `fused_distances_values` from the trajectory .npz.
+    Falls back to camera-pose cumulative distance if fused distances are absent.
+
+    Returns (selected_frames, step_distances) where step_distances[i] is the
+    odometry gap between selected_frames[i] and selected_frames[i+1].
+    """
+    traj = np.load(trajectory_path, allow_pickle=True)
+
+    if "fused_distances_values" in traj and "fused_distances_frames" in traj:
+        fd_frames = traj["fused_distances_frames"].astype(int)
+        fd_vals   = traj["fused_distances_values"].astype(float)
+        mask = (fd_frames >= frame_start) & (fd_frames <= frame_end)
+        fd_frames = fd_frames[mask]
+        fd_vals   = fd_vals[mask]
+    else:
+        # Fallback: cumulative camera translation
+        cameras = traj["pose_cache_cameras"]
+        frames  = traj["pose_cache_frames"].astype(int)
+        values  = traj["pose_cache_values"]
+        cam0 = cameras[0]
+        sel = (cameras == cam0) & (frames >= frame_start) & (frames <= frame_end)
+        order = np.argsort(frames[sel])
+        fd_frames = frames[sel][order]
+        positions = values[sel][order][:, :3, 3]
+        fd_vals = np.concatenate([[0.0],
+                                  np.cumsum(np.linalg.norm(np.diff(positions, axis=0), axis=1))])
+
+    # Greedy walk: keep a frame once at least min_step_m has accumulated
+    selected = [fd_frames[0]]
+    last_dist = fd_vals[0]
+    for i in range(1, len(fd_frames)):
+        if fd_vals[i] - last_dist >= min_step_m:
+            selected.append(fd_frames[i])
+            last_dist = fd_vals[i]
+
+    # Per-step distances for reporting
+    frame_to_dist = dict(zip(fd_frames, fd_vals))
+    step_dists = [frame_to_dist[selected[i+1]] - frame_to_dist[selected[i]]
+                  for i in range(len(selected) - 1)]
+
+    return selected, step_dists
+
+
 # ── image / mask loading ─────────────────────────────────────────────────────
 
 def load_images(cameras, frame_idx, scan_dir):
@@ -610,7 +662,12 @@ def main():
     parser.add_argument("--cameras", nargs="+", default=DEFAULT_CAMERAS)
     parser.add_argument("--frame_start", type=int, default=40)
     parser.add_argument("--frame_end", type=int, default=80)
-    parser.add_argument("--frame_skip", type=int, default=2)
+    parser.add_argument("--frame_skip", type=int, default=None,
+                        help="Fixed frame stride (overrides displacement-based selection). "
+                             "Use only when you want a uniform skip regardless of car speed.")
+    parser.add_argument("--min_step_m", type=float, default=0.15,
+                        help="Minimum car displacement (metres) between consecutive processed frames "
+                             "(default: 0.15 m = 15 cm). Ignored when --frame_skip is given.")
     parser.add_argument("--alignment_threshold", type=float, default=ALIGNMENT_ERR_THRESHOLD)
 
     parser.add_argument("--reproj_ratio", type=float, default=0.7,
@@ -647,7 +704,22 @@ def main():
     device = torch.device("cuda")
     dtype = torch.bfloat16
 
-    frames = list(range(args.frame_start, args.frame_end + 1, args.frame_skip))
+    if args.frame_skip is not None:
+        # Manual override: uniform stride, ignore odometry
+        frames = list(range(args.frame_start, args.frame_end + 1, args.frame_skip))
+        frame_note = f"fixed skip={args.frame_skip} (manual override)"
+        step_summary = None
+    else:
+        # Displacement-based selection: next frame only after ≥ min_step_m of travel
+        frames, step_dists = select_frames_by_displacement(
+            args.trajectory, args.frame_start, args.frame_end, args.min_step_m
+        )
+        mean_cm = (sum(step_dists) / len(step_dists) * 100) if step_dists else 0
+        frame_note = (f"displacement-based (min {args.min_step_m*100:.0f} cm/step), "
+                      f"avg {mean_cm:.1f} cm/step")
+        step_summary = (f"    min={min(step_dists)*100:.1f} cm  "
+                        f"max={max(step_dists)*100:.1f} cm  "
+                        f"mean={mean_cm:.1f} cm") if step_dists else None
 
     if args.enable_reproj:
         args.skip_reproj = False
@@ -656,7 +728,9 @@ def main():
     print("  Car Reconstruction Pipeline")
     print("=" * 70)
     print(f"  Cameras : {args.cameras}")
-    print(f"  Frames  : {args.frame_start}–{args.frame_end}  skip={args.frame_skip}  ({len(frames)} frames)")
+    print(f"  Frames  : {args.frame_start}–{args.frame_end}  →  {len(frames)} selected  [{frame_note}]")
+    if step_summary:
+        print(f"  Step gaps:{step_summary}")
     print(f"  Output  : {args.output_dir}")
     print(f"  Stages  : 1-inference({'skip' if args.skip_inference else 'run'})  "
           f"3-reproj({'skip' if args.skip_reproj else f'ratio>={args.reproj_ratio:.0%}'})  "

@@ -28,6 +28,7 @@ import torch
 from torchvision import transforms
 from safetensors.torch import load_file
 from plyfile import PlyData, PlyElement
+import open3d as o3d
 
 from pi3.models.pi3x import Pi3X
 from pi3.utils.basic import write_ply
@@ -504,6 +505,99 @@ def write_bbox_viz_ply(xyz, rgb, bbox, path):
     write_merged_ply(all_xyz, all_rgb, path)
 
 
+# ── Stage 5: Poisson mesh reconstruction ─────────────────────────────────────
+
+def point_cloud_to_mesh(
+    input_path: str,
+    output_path: str,
+    depth: int = 9,
+    density_quantile: float = 0.01,
+    normal_radius: float = 0.1,
+    normal_nn: int = 30,
+    orient_k: int = 30,
+    reestimate_normals: bool = True,
+    voxel_size: float | None = None,
+) -> str:
+    """Convert a point cloud PLY to a triangle mesh via Poisson reconstruction.
+
+    Returns the output path on success.
+    """
+    from pathlib import Path as _Path
+    in_p  = _Path(input_path)
+    out_p = _Path(output_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+
+    _banner("STAGE 5: Poisson mesh reconstruction")
+
+    # 5a. Load
+    print(f"  [5a] Loading point cloud: {in_p.name} …")
+    t0  = time.time()
+    pcd = o3d.io.read_point_cloud(str(in_p))
+    n_pts = len(pcd.points)
+    print(f"       {n_pts:,} points  ({time.time()-t0:.1f}s)")
+    if n_pts == 0:
+        raise ValueError("Point cloud is empty — cannot build mesh.")
+
+    # 5b. Normals
+    need = reestimate_normals or not pcd.has_normals()
+    if need:
+        vox = voxel_size
+        if vox is None and n_pts > 2_000_000:
+            vox = 0.02          # 2 cm — fast enough for large clouds
+            print(f"  [5b] Large cloud ({n_pts:,} pts) — downsampling to {vox} m voxels …")
+        if vox is not None:
+            pcd = pcd.voxel_down_sample(vox)
+            print(f"       Downsampled to {len(pcd.points):,} pts")
+        print(f"  [5b] Estimating & orienting normals …")
+        t0 = time.time()
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                radius=normal_radius, max_nn=normal_nn
+            )
+        )
+        pcd.orient_normals_consistent_tangent_plane(orient_k)
+        print(f"       Done  ({time.time()-t0:.1f}s)")
+    else:
+        print("  [5b] Normals already present — skipping estimation.")
+
+    # 5c. Poisson reconstruction
+    print(f"  [5c] Poisson reconstruction (depth={depth}) …")
+    t0 = time.time()
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd, depth=depth, width=0, scale=1.1, linear_fit=False
+    )
+    print(f"       Initial: {len(mesh.vertices):,} vertices, "
+          f"{len(mesh.triangles):,} triangles  ({time.time()-t0:.1f}s)")
+    if len(mesh.vertices) == 0:
+        raise RuntimeError(
+            "Poisson returned an empty mesh. Try --mesh-reestimate-normals "
+            "or a coarser --mesh-voxel-size."
+        )
+
+    # 5d. Density filtering
+    print(f"  [5d] Removing low-density vertices (quantile={density_quantile}) …")
+    threshold = np.quantile(densities, density_quantile)
+    mesh.remove_vertices_by_mask(np.asarray(densities) < threshold)
+    print(f"       After filter: {len(mesh.vertices):,} vertices, "
+          f"{len(mesh.triangles):,} triangles")
+
+    # 5e. Save
+    print(f"  [5e] Saving → {out_p.name} …")
+    t0 = time.time()
+    o3d.io.write_triangle_mesh(str(out_p), mesh)
+    mb = out_p.stat().st_size / 1e6
+    print(f"       Saved  ({mb:.1f} MB, {time.time()-t0:.1f}s)")
+
+    return str(out_p)
+
+
+def _banner(title: str) -> None:
+    """Print a stage separator banner."""
+    print(f"\n{'─' * 70}")
+    print(f"  {title}")
+    print(f"{'─' * 70}")
+
+
 # ── main pipeline ────────────────────────────────────────────────────────────
 
 def main():
@@ -536,6 +630,17 @@ def main():
     parser.add_argument("--skip_inference", action="store_true",
                         help="Reuse existing per-frame PLYs, skip Pi3X inference")
 
+    # Stage 5 – mesh generation
+    parser.add_argument("--skip_mesh", action="store_true",
+                        help="Skip Stage 5: Poisson mesh reconstruction")
+    parser.add_argument("--mesh_depth", type=int, default=9,
+                        help="Poisson octree depth (default 9)")
+    parser.add_argument("--mesh_density_quantile", type=float, default=0.01,
+                        help="Remove mesh vertices below this density quantile (default 0.01)")
+    parser.add_argument("--mesh_voxel_size", type=float, default=None,
+                        help="Voxel size (m) for downsampling before normal estimation. "
+                             "Auto-set to 0.02 for clouds >2M pts.")
+
     args = parser.parse_args()
 
     t_start = time.time()
@@ -544,15 +649,18 @@ def main():
 
     frames = list(range(args.frame_start, args.frame_end + 1, args.frame_skip))
 
+    if args.enable_reproj:
+        args.skip_reproj = False
+
     print("=" * 70)
     print("  Car Reconstruction Pipeline")
     print("=" * 70)
-    print(f"  Cameras:  {args.cameras}")
-    print(f"  Frames:   {args.frame_start}-{args.frame_end} skip {args.frame_skip} ({len(frames)} frames)")
-    print(f"  Output:   {args.output_dir}")
-    if args.enable_reproj:
-        args.skip_reproj = False
-    print(f"  Reproj:   {'skip' if args.skip_reproj else f'ratio >= {args.reproj_ratio:.0%}'}")
+    print(f"  Cameras : {args.cameras}")
+    print(f"  Frames  : {args.frame_start}–{args.frame_end}  skip={args.frame_skip}  ({len(frames)} frames)")
+    print(f"  Output  : {args.output_dir}")
+    print(f"  Stages  : 1-inference({'skip' if args.skip_inference else 'run'})  "
+          f"3-reproj({'skip' if args.skip_reproj else f'ratio>={args.reproj_ratio:.0%}'})  "
+          f"5-mesh({'skip' if args.skip_mesh else f'depth={args.mesh_depth}'})")
     print(f"  Bbox pad: front={args.pad_front:.2f} rear={args.pad_rear:.2f} "
           f"top={args.pad_top:.2f} bottom={args.pad_bottom:.2f} "
           f"left={args.pad_left:.2f} right={args.pad_right:.2f}")
@@ -570,29 +678,34 @@ def main():
 
     # ── Stage 1: Per-frame Pi3X inference ────────────────────────────────────
 
-    print(f"\n{'─' * 70}")
-    print("  STAGE 1: Per-frame Pi3X inference")
-    print(f"{'─' * 70}")
+    _banner(f"STAGE 1 / 5  ▸  Per-frame Pi3X inference  ({len(frames)} frames)")
 
     all_pi3_poses = {}
 
     if args.skip_inference:
-        print("  [skip_inference] Reusing existing per-frame PLYs")
+        print("  [skip] Reusing existing per-frame PLYs")
         for frame_idx in frames:
             fk = f"frame_{frame_idx:04d}"
             ply_path = os.path.join(args.output_dir, f"{fk}_caronly.ply")
             if os.path.exists(ply_path):
                 all_pi3_poses[fk] = None
+        print(f"  Found {len(all_pi3_poses)} existing per-frame PLYs")
     else:
-        print("  Loading Pi3X model...")
+        print("  Loading Pi3X model …")
+        t_model = time.time()
         model = Pi3X.from_pretrained("yyfz233/Pi3X", use_multimodal=True).eval()
         model = model.to(device)
+        print(f"  Model loaded  ({time.time()-t_model:.1f}s)")
 
-        for frame_idx in frames:
+        n_frames = len(frames)
+        for fi, frame_idx in enumerate(frames):
             fk = f"frame_{frame_idx:04d}"
+            t_frame = time.time()
+            print(f"  [{fi+1:>3}/{n_frames}] {fk} …", end="", flush=True)
+
             imgs, labels, scale_info = load_images(args.cameras, frame_idx, args.scan_dir)
             if imgs is None or len(labels) < 2:
-                print(f"    {fk}: not enough images, skipping")
+                print(" SKIP (not enough images)")
                 continue
 
             ftraj = {}
@@ -627,25 +740,29 @@ def main():
 
             poses_np = res["camera_poses"][0].cpu().numpy()
             all_pi3_poses[fk] = (poses_np, labels)
-            print(f"    {fk}: {combined.sum().item():>7,} pts")
+            n_pts = combined.sum().item()
+            print(f"  {n_pts:>7,} pts  ({time.time()-t_frame:.1f}s)")
             del res, imgs_gpu
             torch.cuda.empty_cache()
 
         del model
         torch.cuda.empty_cache()
+        print(f"\n  Stage 1 complete: {len(all_pi3_poses)} frames inferred")
 
     # ── Stage 2: Stitch with Umeyama alignment ──────────────────────────────
 
-    print(f"\n{'─' * 70}")
-    print("  STAGE 2: Stitch frames (Umeyama full-pose alignment)")
-    print(f"{'─' * 70}")
+    _banner("STAGE 2 / 5  ▸  Stitch frames (Umeyama full-pose alignment)")
 
     all_xyz, all_rgb = [], []
     n_passed, n_total = 0, 0
 
     pose_model = None
+    frame_plys = [f for f in frames
+                  if os.path.exists(os.path.join(args.output_dir, f"frame_{f:04d}_caronly.ply"))]
+    n_stitch = len(frame_plys)
+    print(f"  Stitching {n_stitch} available frame PLYs …")
 
-    for frame_idx in frames:
+    for fi, frame_idx in enumerate(frames):
         fk = f"frame_{frame_idx:04d}"
         ply_path = os.path.join(args.output_dir, f"{fk}_caronly.ply")
         if not os.path.exists(ply_path):
@@ -663,7 +780,7 @@ def main():
             if imgs is None or len(labels) < 2:
                 continue
             if pose_model is None:
-                print("  Loading Pi3X model for pose estimation...")
+                print("  Loading Pi3X model for pose estimation …")
                 pose_model = Pi3X.from_pretrained("yyfz233/Pi3X", use_multimodal=True).eval()
                 pose_model = pose_model.to(device)
 
@@ -705,8 +822,9 @@ def main():
             all_rgb.append(rgb)
             n_passed += 1
 
-        status = "OK" if passed else "SKIP"
-        print(f"    {fk}: {len(xyz):>7,} pts | s={s:.4f} | err={err:.4f} m | {status}")
+        status = "✓ OK  " if passed else "✗ SKIP"
+        print(f"  [{n_total:>3}/{n_stitch}] {fk}: {len(xyz):>7,} pts | "
+              f"s={s:.4f} | err={err:.4f} m | {status}")
 
     if pose_model is not None:
         del pose_model
@@ -718,18 +836,18 @@ def main():
 
     merged_xyz = np.concatenate(all_xyz, axis=0)
     merged_rgb = np.concatenate(all_rgb, axis=0)
-    print(f"\n  Stitched: {len(merged_xyz):,} points ({n_passed}/{n_total} frames passed)")
+    print(f"\n  Stage 2 complete: {len(merged_xyz):,} points  "
+          f"({n_passed}/{n_total} frames passed, "
+          f"{n_total - n_passed} skipped — err > {args.alignment_threshold} m)")
 
     stitched_path = os.path.join(args.output_dir, "stitched_raw.ply")
     write_merged_ply(merged_xyz, merged_rgb, stitched_path)
-    print(f"  Saved: {stitched_path} ({os.path.getsize(stitched_path) / 1024 ** 2:.1f} MB)")
+    print(f"  Saved: stitched_raw.ply  ({os.path.getsize(stitched_path) / 1024 ** 2:.1f} MB)")
 
     # ── Stage 3: Reprojection filter ─────────────────────────────────────────
 
     if not args.skip_reproj:
-        print(f"\n{'─' * 70}")
-        print(f"  STAGE 3: Reprojection filter (ratio >= {args.reproj_ratio:.0%})")
-        print(f"{'─' * 70}")
+        _banner(f"STAGE 3 / 5  ▸  Reprojection filter  (ratio ≥ {args.reproj_ratio:.0%})")
 
         merged_xyz, merged_rgb = reprojection_filter(
             merged_xyz, merged_rgb, cam_info, traj_cams, traj_frames, traj_poses,
@@ -737,15 +855,14 @@ def main():
 
         reproj_path = os.path.join(args.output_dir, f"stitched_reproj_{int(args.reproj_ratio * 100)}.ply")
         write_merged_ply(merged_xyz, merged_rgb, reproj_path)
-        print(f"  Saved: {reproj_path} ({os.path.getsize(reproj_path) / 1024 ** 2:.1f} MB)")
+        print(f"  Saved: stitched_reproj_{int(args.reproj_ratio * 100)}.ply  "
+              f"({os.path.getsize(reproj_path) / 1024 ** 2:.1f} MB)")
     else:
-        print(f"\n  [skip_reproj] Skipping reprojection filter")
+        print(f"\n  [skip] Stage 3 — reprojection filter skipped")
 
     # ── Stage 4: Bounding box estimation and crop ────────────────────────────
 
-    print(f"\n{'─' * 70}")
-    print("  STAGE 4: Bounding box estimation and crop")
-    print(f"{'─' * 70}")
+    _banner("STAGE 4 / 5  ▸  Bounding box estimation and crop")
 
     dims = estimate_bbox(cam_info, traj_cams, traj_frames, traj_poses,
                          merged_xyz, args.scan_dir)
@@ -758,26 +875,46 @@ def main():
 
     final_xyz, final_rgb, bbox = apply_bbox(merged_xyz, merged_rgb, dims, merged_xyz, pad)
 
-    # ── Write final outputs ──────────────────────────────────────────────────
-
-    print(f"\n{'─' * 70}")
-    print("  Writing final outputs")
-    print(f"{'─' * 70}")
+    # ── Write Stage 4 outputs ─────────────────────────────────────────────────
 
     out_path = os.path.join(args.output_dir, "car_final.ply")
     write_merged_ply(final_xyz, final_rgb, out_path)
+    print(f"\n  Saved: car_final.ply  "
+          f"({os.path.getsize(out_path) / 1024 ** 2:.1f} MB, {len(final_xyz):,} pts)")
 
     viz_path = os.path.join(args.output_dir, "car_final_viz.ply")
     write_bbox_viz_ply(final_xyz, final_rgb, bbox, viz_path)
+    print(f"  Saved: car_final_viz.ply  ({os.path.getsize(viz_path) / 1024 ** 2:.1f} MB)")
+
+    # ── Stage 5: Poisson mesh reconstruction ─────────────────────────────────
+
+    mesh_path = None
+    if not args.skip_mesh:
+        mesh_out = os.path.join(args.output_dir, "car_final_mesh.ply")
+        mesh_path = point_cloud_to_mesh(
+            input_path=out_path,
+            output_path=mesh_out,
+            depth=args.mesh_depth,
+            density_quantile=args.mesh_density_quantile,
+            voxel_size=args.mesh_voxel_size,
+            reestimate_normals=True,
+        )
+    else:
+        print(f"\n  [skip] Stage 5 — mesh reconstruction skipped")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
 
     elapsed = time.time() - t_start
     print(f"\n{'=' * 70}")
-    print(f"  DONE")
-    print(f"  Output:     {out_path} ({os.path.getsize(out_path) / 1024 ** 2:.1f} MB)")
-    print(f"  Viz:        {viz_path} ({os.path.getsize(viz_path) / 1024 ** 2:.1f} MB)")
-    print(f"  Points:     {len(final_xyz):,}")
-    print(f"  Dimensions: L={dims['length']:.2f}m  W={dims['width']:.2f}m  H={dims['height']:.2f}m")
-    print(f"  Time:       {elapsed:.0f}s")
+    print(f"  DONE  ({elapsed:.0f}s total)")
+    print(f"{'─' * 70}")
+    print(f"  Point cloud : car_final.ply  "
+          f"({os.path.getsize(out_path) / 1024 ** 2:.1f} MB, {len(final_xyz):,} pts)")
+    if mesh_path:
+        print(f"  Mesh        : car_final_mesh.ply  "
+              f"({os.path.getsize(mesh_path) / 1024 ** 2:.1f} MB)")
+    print(f"  Dimensions  : L={dims['length']:.2f} m  "
+          f"W={dims['width']:.2f} m  H={dims['height']:.2f} m")
     print(f"{'=' * 70}")
 
 

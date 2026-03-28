@@ -47,9 +47,19 @@ ALIGNMENT_ERR_THRESHOLD = 0.3
 
 # ── calibration & trajectory ─────────────────────────────────────────────────
 
-def parse_calibration(scan_dir):
-    """Parse extrinsics.yaml → dict[cam_name] → {c2w, K, resolution, dist_coeffs}."""
-    with open(os.path.join(scan_dir, "extrinsics.yaml")) as f:
+def parse_calibration(scan_dir, extrinsics_path=None):
+    """Parse extrinsics.yaml → dict[cam_name] → {c2w, K, resolution, dist_coeffs}.
+
+    Args:
+        scan_dir: Directory containing camera image sub-folders. Used as fallback
+            for extrinsics.yaml when extrinsics_path is None.
+        extrinsics_path: Explicit path to extrinsics.yaml. Allows the calibration
+            file to live in a different directory from the raw frames (e.g. the
+            UV-3D calibration directory vs. the images directory).
+    """
+    if extrinsics_path is None:
+        extrinsics_path = os.path.join(scan_dir, "extrinsics.yaml")
+    with open(extrinsics_path) as f:
         ext_data = yaml.safe_load(f)
     cam_order_keys = sorted(
         [k for k in ext_data if k.startswith("cam")],
@@ -180,12 +190,30 @@ def build_condition_tensors(labels, cam_info, traj_poses, scale_info, device):
             torch.from_numpy(Ks).float().unsqueeze(0).to(device))
 
 
-def load_car_masks(labels, frame_name, H, W, scan_dir):
-    mask_name = frame_name.replace(".png", "_mask.png")
+def resolve_mask_path(masks_dir, cam, frame_name):
+    """Return the mask file path for a given camera and frame.
+
+    Tries two naming conventions:
+      1. frame_NNNN_mask.png  — raw-scan layout (default)
+      2. frame_NNNN.png       — UV-3D segmentation stage layout
+
+    Returns None if neither exists.
+    """
+    name1 = frame_name.replace(".png", "_mask.png")
+    p1 = os.path.join(masks_dir, cam, name1)
+    if os.path.exists(p1):
+        return p1
+    p2 = os.path.join(masks_dir, cam, frame_name)
+    if os.path.exists(p2):
+        return p2
+    return None
+
+
+def load_car_masks(labels, frame_name, H, W, masks_dir):
     masks = []
     for cam in labels:
-        mask_path = os.path.join(scan_dir, "masks", cam, mask_name)
-        if os.path.exists(mask_path):
+        mask_path = resolve_mask_path(masks_dir, cam, frame_name)
+        if mask_path is not None:
             m = Image.open(mask_path).convert("L").resize((W, H), Image.Resampling.NEAREST)
             masks.append(np.array(m) > 128)
         else:
@@ -256,7 +284,7 @@ def project_points(xyz_world, w2c, K, dist, W, H):
 
 
 def reprojection_filter(xyz, rgb, cam_info, traj_cams, traj_frames, traj_poses,
-                        cameras, frames, scan_dir, ratio_threshold, batch_size=500000):
+                        cameras, frames, masks_dir, ratio_threshold, batch_size=500000):
     """Keep points where car_hits / visible_views >= ratio_threshold."""
     N = xyz.shape[0]
     car_count = np.zeros(N, dtype=np.int32)
@@ -271,8 +299,8 @@ def reprojection_filter(xyz, rgb, cam_info, traj_cams, traj_frames, traj_poses,
             c2w = traj_poses[sel][0]
             w2c = np.linalg.inv(c2w)
             info = cam_info[cam]
-            mask_path = os.path.join(scan_dir, "masks", cam, f"frame_{frame_idx:04d}_mask.png")
-            if not os.path.exists(mask_path):
+            mask_path = resolve_mask_path(masks_dir, cam, f"frame_{frame_idx:04d}.png")
+            if mask_path is None:
                 continue
             views.append((cam, frame_idx, w2c, info["K"], info["dist_coeffs"], mask_path))
 
@@ -309,7 +337,7 @@ def reprojection_filter(xyz, rgb, cam_info, traj_cams, traj_frames, traj_poses,
 
 # ── bounding box estimation ──────────────────────────────────────────────────
 
-def estimate_bbox(cam_info, traj_cams, traj_frames, traj_poses, xyz_points, scan_dir):
+def estimate_bbox(cam_info, traj_cams, traj_frames, traj_poses, xyz_points, masks_dir):
     """Estimate car bounding box from masks, calibration, and trajectory."""
 
     # WIDTH from cam_04 (right side) and cam_06 (left side) overhead cameras.
@@ -326,8 +354,8 @@ def estimate_bbox(cam_info, traj_cams, traj_frames, traj_poses, xyz_points, scan
 
         extreme_col, extreme_frame = None, None
         for f in range(0, 120):
-            mp = os.path.join(scan_dir, "masks", cam_name, f"frame_{f:04d}_mask.png")
-            if not os.path.exists(mp):
+            mp = resolve_mask_path(masks_dir, cam_name, f"frame_{f:04d}.png")
+            if mp is None:
                 continue
             m = np.array(Image.open(mp).convert("L")) > 128
             cols = np.where(m.any(axis=0))[0]
@@ -363,29 +391,87 @@ def estimate_bbox(cam_info, traj_cams, traj_frames, traj_poses, xyz_points, scan
     else:
         car_width = 1.83
 
-    # LENGTH from trajectory displacement
-    first_frame, last_frame = None, None
+    # FRONT / REAR (X axis) from cam_05 (overhead) mask ray-casting.
+    #
+    # cam_05 looks straight down at the car.  Each frame the mask outline
+    # of the car is visible.  We iterate every frame that has mask pixels,
+    # find the extreme rows (min row = leading edge, max row = trailing edge
+    # in image space), ray-cast each extreme pixel through the floor plane
+    # and record the resulting world X coordinate.  The overall min/max world
+    # X across all frames are the actual front and rear bumper positions.
+    #
+    # This mirrors the cam_04 / cam_06 width estimation exactly.
+    cam5_K = cam_info["at_cam_05"]["K"]
+    fx5, fy5 = cam5_K[0, 0], cam5_K[1, 1]
+    cx5, cy5 = cam5_K[0, 2], cam5_K[1, 2]
+
+    x_front, x_rear = None, None   # world X of front / rear bumper
+
     for f in range(0, 120):
-        mp = os.path.join(scan_dir, "masks", "at_cam_05", f"frame_{f:04d}_mask.png")
-        if not os.path.exists(mp):
+        mp = resolve_mask_path(masks_dir, "at_cam_05", f"frame_{f:04d}.png")
+        if mp is None:
             continue
         m = np.array(Image.open(mp).convert("L")) > 128
-        if m[center_row, :].any():
-            if first_frame is None:
-                first_frame = f
-            last_frame = f
+        rows = np.where(m.any(axis=1))[0]
+        if len(rows) == 0:
+            continue
 
-    if first_frame is not None and last_frame is not None:
-        sel_f = (traj_cams == "at_cam_05") & (traj_frames == first_frame)
-        sel_l = (traj_cams == "at_cam_05") & (traj_frames == last_frame)
-        if sel_f.any() and sel_l.any():
-            pos_first = traj_poses[sel_f][0][:3, 3]
-            pos_last = traj_poses[sel_l][0][:3, 3]
-            car_length = np.linalg.norm(pos_last - pos_first)
+        sel = (traj_cams == "at_cam_05") & (traj_frames == f)
+        if not sel.any():
+            continue
+        c2w = traj_poses[sel][0]
+        cam_pos = c2w[:3, 3]
+
+        for row, label in [(rows.min(), "leading"), (rows.max(), "trailing")]:
+            cols_at_row = np.where(m[row, :])[0]
+            col = int(np.median(cols_at_row))
+            x_n = (col  - cx5) / fx5
+            y_n = (row  - cy5) / fy5
+            ray_cam   = np.array([x_n, y_n, 1.0])
+            ray_world = c2w[:3, :3] @ ray_cam
+            # intersect with floor plane (world Y = floor_y_est)
+            if abs(ray_world[1]) < 1e-6:
+                continue
+            t = (floor_y_est - cam_pos[1]) / ray_world[1]
+            if t < 0:
+                continue
+            wx = cam_pos[0] + t * ray_world[0]
+            if label == "leading":
+                if x_front is None or wx > x_front:
+                    x_front = wx
+            else:
+                if x_rear is None or wx < x_rear:
+                    x_rear = wx
+
+    if x_front is not None and x_rear is not None:
+        car_length = x_front - x_rear
+        print(f"  Front/rear from cam_05 rays: X_front={x_front:.3f}, X_rear={x_rear:.3f}, "
+              f"length={car_length:.2f} m")
+    else:
+        # Fallback: camera displacement (original method)
+        x_front, x_rear = None, None
+        first_frame, last_frame = None, None
+        for f in range(0, 120):
+            mp = resolve_mask_path(masks_dir, "at_cam_05", f"frame_{f:04d}.png")
+            if mp is None:
+                continue
+            m = np.array(Image.open(mp).convert("L")) > 128
+            if m[center_row, :].any():
+                if first_frame is None:
+                    first_frame = f
+                last_frame = f
+        if first_frame is not None and last_frame is not None:
+            sel_f = (traj_cams == "at_cam_05") & (traj_frames == first_frame)
+            sel_l = (traj_cams == "at_cam_05") & (traj_frames == last_frame)
+            if sel_f.any() and sel_l.any():
+                pos_first = traj_poses[sel_f][0][:3, 3]
+                pos_last  = traj_poses[sel_l][0][:3, 3]
+                car_length = float(np.linalg.norm(pos_last - pos_first))
+            else:
+                car_length = 3.40
         else:
             car_length = 3.40
-    else:
-        car_length = 3.40
+        print(f"  Front/rear fallback (camera displacement): length={car_length:.2f} m")
 
     # BOTTOM (floor Y) from cam_01 side camera.
     # cam_01 Y-axis maps directly to world +Y (floor direction).
@@ -401,8 +487,8 @@ def estimate_bbox(cam_info, traj_cams, traj_frames, traj_poses, xyz_points, scan
     cam1_H = cam_info["at_cam_01"]["resolution"][1]
     max_row, max_row_col, max_row_frame = None, None, None
     for f in range(0, 120):
-        mp = os.path.join(scan_dir, "masks", "at_cam_01", f"frame_{f:04d}_mask.png")
-        if not os.path.exists(mp):
+        mp = resolve_mask_path(masks_dir, "at_cam_01", f"frame_{f:04d}.png")
+        if mp is None:
             continue
         m = np.array(Image.open(mp).convert("L")) > 128
         rows = np.where(m.any(axis=1))[0]
@@ -447,6 +533,10 @@ def estimate_bbox(cam_info, traj_cams, traj_frames, traj_poses, xyz_points, scan
         result["z_left"] = z_left
     if y_bottom is not None:
         result["y_bottom"] = y_bottom
+    if x_front is not None:
+        result["x_front"] = x_front
+    if x_rear is not None:
+        result["x_rear"] = x_rear
     return result
 
 
@@ -465,8 +555,14 @@ def apply_bbox(xyz, rgb, dims, xyz_points, pad):
     p95 = np.percentile(xyz_points, 95, axis=0)
     center = (p5 + p95) / 2
 
-    car_rear_x = center[0] - dims["length"] / 2
-    car_front_x = center[0] + dims["length"] / 2
+    if "x_front" in dims and "x_rear" in dims:
+        # Use ray-cast absolute positions (accurate)
+        car_front_x = dims["x_front"]
+        car_rear_x  = dims["x_rear"]
+    else:
+        # Fall back to center ± half length
+        car_rear_x  = center[0] - dims["length"] / 2
+        car_front_x = center[0] + dims["length"] / 2
     if "y_bottom" in dims:
         floor_y = dims["y_bottom"]
         roof_y = floor_y - dims["height"]
@@ -657,6 +753,18 @@ def main():
         description="End-to-end car reconstruction: Pi3X → stitch → reproj filter → bbox crop")
 
     parser.add_argument("--scan_dir", type=str, default=DEFAULT_SCAN_DIR)
+    parser.add_argument(
+        "--extrinsics", type=str, default=None,
+        help="Explicit path to extrinsics.yaml. "
+             "Default: {scan_dir}/extrinsics.yaml. "
+             "Use when calibration lives separately from images (e.g. UV-3D sessions)."
+    )
+    parser.add_argument(
+        "--masks_dir", type=str, default=None,
+        help="Directory containing per-camera car silhouette masks. "
+             "Accepts frame_NNNN_mask.png (raw scan) or frame_NNNN.png (UV-3D segmentation). "
+             "Default: {scan_dir}/masks"
+    )
     parser.add_argument("--trajectory", type=str, default=DEFAULT_TRAJECTORY)
     parser.add_argument("--output_dir", type=str, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--cameras", nargs="+", default=DEFAULT_CAMERAS)
@@ -699,6 +807,10 @@ def main():
                              "Auto-set to 0.02 for clouds >2M pts.")
 
     args = parser.parse_args()
+
+    # Resolve masks_dir: explicit arg → {scan_dir}/masks (default)
+    if args.masks_dir is None:
+        args.masks_dir = os.path.join(args.scan_dir, "masks")
 
     t_start = time.time()
     device = torch.device("cuda")
@@ -743,7 +855,7 @@ def main():
     # ── Setup ────────────────────────────────────────────────────────────────
 
     print("\nParsing calibration...")
-    cam_info = parse_calibration(args.scan_dir)
+    cam_info = parse_calibration(args.scan_dir, extrinsics_path=args.extrinsics)
 
     print("Loading trajectory...")
     traj_cams, traj_frames, traj_poses = load_trajectory(args.trajectory)
@@ -803,7 +915,7 @@ def main():
             TH, TW = imgs.shape[2], imgs.shape[3]
             fn = f"frame_{frame_idx:04d}.png"
             car_masks = torch.from_numpy(
-                load_car_masks(labels, fn, TH, TW, args.scan_dir)
+                load_car_masks(labels, fn, TH, TW, args.masks_dir)
             ).to(conf_mask.device)
             combined = torch.logical_and(conf_mask, car_masks)
 
@@ -925,7 +1037,7 @@ def main():
 
         merged_xyz, merged_rgb = reprojection_filter(
             merged_xyz, merged_rgb, cam_info, traj_cams, traj_frames, traj_poses,
-            args.cameras, frames, args.scan_dir, args.reproj_ratio)
+            args.cameras, frames, args.masks_dir, args.reproj_ratio)
 
         reproj_path = os.path.join(args.output_dir, f"stitched_reproj_{int(args.reproj_ratio * 100)}.ply")
         write_merged_ply(merged_xyz, merged_rgb, reproj_path)
@@ -939,7 +1051,7 @@ def main():
     _banner("STAGE 4 / 5  ▸  Bounding box estimation and crop")
 
     dims = estimate_bbox(cam_info, traj_cams, traj_frames, traj_poses,
-                         merged_xyz, args.scan_dir)
+                         merged_xyz, args.masks_dir)
 
     pad = {
         "front": args.pad_front, "rear": args.pad_rear,
